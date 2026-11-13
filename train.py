@@ -156,14 +156,7 @@ class Trial:
         return np.where(self.law_increment > 0, predicted_increment, 0)
 
     def advance(self, increment):
-        # 双线性律从同一个深度屈服超量得到位移增量和硬化增量。
-        # 网络改变表面增量后，两者必须用同一比例推进。
-        yielded = self.law_increment > 0
-        ratio = np.divide(increment, self.law_increment,
-                          out=np.zeros_like(self.law_increment), where=yielded)
-        hardening_change = self.next_hardening - self.state.hardening
-        hardening = self.state.hardening + ratio[None] * hardening_change
-        return PlasticState(self.state.displacement + increment, hardening,
+        return PlasticState(self.state.displacement + increment, self.next_hardening,
                             self.contact.pressure, self.state.step + 1)
 
 
