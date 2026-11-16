@@ -11,6 +11,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from train_elastic import ELASTIC_WEIGHTS, load_elastic
 import train as solver
 
 
@@ -45,7 +46,7 @@ def train_and_check(model, rows, features, physics, epochs, batch, output, size)
             return updated
         saved = expected.get(case_id)
         if saved is None:
-            assert trial.state.step == 0 and trial.state.previous_pressure is None, (batch, case_id)
+            assert trial.state.step == 0, (batch, case_id)
             assert np.all(trial.state.displacement == 0), (batch, case_id)
             assert np.all(trial.state.hardening == row["Q1"]), (batch, case_id)
         else:
@@ -89,18 +90,21 @@ def train_and_check(model, rows, features, physics, epochs, batch, output, size)
 def check_batch_math(model, rows, features, physics):
     """冻结权重和输入，核对批量预测及批量损失的归约。"""
     trials = [solver.evaluate_state(row, physics.initial_state(row), physics) for row in rows]
-    x = torch.stack([features(row, trial.state, trial.contact) for row, trial in zip(rows, trials)])
-    scale = x.new_tensor([trial.increment_scale for trial in trials])[:, None, None]
+    x = torch.stack([features(row, trial.state.displacement, trial.contact.pressure, trial.contact.elastic)
+                     for row, trial in zip(rows, trials)])
     law = torch.as_tensor(np.stack([trial.law_increment for trial in trials]), device=x.device)
+    law_hardening = torch.as_tensor(
+        np.stack([trial.next_hardening - trial.state.hardening for trial in trials]), device=x.device)
     high = torch.as_tensor(np.stack([solver.high_pressure_mask(trial.contact.pressure) for trial in trials]),
                            device=x.device)
-    divisor = law.amax(dim=(1, 2), keepdim=True).clamp_min(5 * solver.PLASTIC_TOL_MM)
-    together = model(x, tuple(range(len(rows)))) * scale
-    separately = torch.cat([model(x[i:i + 1], (0,)) for i in range(len(rows))]) * scale
-    torch.testing.assert_close(together, separately, rtol=2e-4, atol=1e-9)
-    residual = (together - law) / divisor
-    batch_loss = solver.loss_parts(residual, high)
-    individual = [solver.loss_parts(residual[i:i + 1], high[i:i + 1]) for i in range(len(rows))]
+    together = model.increments(x, tuple(range(len(rows))), *solver.increment_parameters(x, rows, physics))
+    separately = [model.increments(x[i:i + 1], (0,), *solver.increment_parameters(x, [row], physics))
+                  for i, row in enumerate(rows)]
+    for batch_output, single_outputs in zip(together, zip(*separately)):
+        torch.testing.assert_close(batch_output, torch.cat(single_outputs), rtol=2e-4, atol=1e-9)
+    batch_loss = solver.coupled_loss(*together, law, law_hardening, high)
+    individual = [solver.coupled_loss(*prediction, law[i:i + 1], law_hardening[i:i + 1], high[i:i + 1])
+                  for i, prediction in enumerate(separately)]
     torch.testing.assert_close(batch_loss, torch.stack(individual).mean(0), rtol=2e-5, atol=1e-8)
 
 
@@ -110,21 +114,24 @@ def main():
     parser.add_argument("--epochs", type=int, default=8, help="每组工况的访问次数")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--elastic-checkpoint", type=Path, default=ELASTIC_WEIGHTS)
     args = parser.parse_args()
+    if not args.elastic_checkpoint.is_file():
+        parser.error("请先运行 train_elastic.py 训练弹性模型，或用 --elastic-checkpoint 指定权重。")
     if args.epochs < 1:
         parser.error("--epochs 必须为正整数。")
     torch.set_num_threads(4)
     rows, h, dx, dy, dz = solver.load_inputs(solver.DATA, args.size)
     rows = rows[:25]
-    physics = solver.BilinearPhysics(solver.ElasticContact(h, dx, dy, workers=1), dx, dy, dz, 4)
-    features = solver.Features(h, dx * dy, args.device, len(physics.weights))
+    physics = solver.BilinearPhysics(load_elastic(args.elastic_checkpoint, h, dx, dy, args.device), dx, dy, dz, 4)
+    features = solver.Features(h, dx * dy, args.device)
     output = args.output or solver.ROOT / "batch_checks" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=True)
     summaries = {}
     orders = []
     for batch in (1, 4):
         torch.manual_seed(42)
-        model = solver.PlasticFNO(features.channels, field_channels=features.field_channels).to(args.device)
+        model = solver.PlasticFNO(features.channels, depth_count=len(physics.weights), field_channels=features.field_channels).to(args.device)
         print(f"测试 batch={batch}，每个训练工况访问 {args.epochs} 次", flush=True)
         summaries[batch], order = train_and_check(model, rows, features, physics, args.epochs, batch,
                                                  output / f"batch_{batch}", args.size)

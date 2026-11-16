@@ -14,9 +14,10 @@ DATA = ROOT / "data"
 SIZE = 512
 STAGES = ((3000, 0), (1000, 200), (0, 200))  # Adam 更新数，L-BFGS 外层步数
 MAX_PLASTIC_STEPS = 500
+MAX_VALIDATION_STEPS = 10000
 PLASTIC_TOL_MM = 1e-6
-TRAINING_METHOD = "online_constitutive_residual_v1"
-ROLLOUT_REVISION = 2
+TRAINING_METHOD = "online_coupled_hardening_elastic_mlp_v1"
+ROLLOUT_REVISION = 4
 ELASTIC_REL_L2_LIMIT = 0.05
 VALIDATION_MSE_FACTOR = 0.0025  # 压力、塑性位移的 MSE 门槛占对应参考场均方值的比例
 WIDTH, MODES, BLOCKS = 12, 8, 3
@@ -29,8 +30,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from train_elastic import ELASTIC_WEIGHTS, load_elastic
 from physics import (
-    BilinearPhysics, Contact, ElasticContact, PlasticState, effective_modulus, load_inputs,
+    BilinearPhysics, Contact, PlasticState, effective_modulus, load_inputs,
     references, surfaces,
 )
 
@@ -59,21 +61,21 @@ class PlasticFNO(nn.Module):
     """标准二维 FNO，每个塑性步叠加浅层 U-Net 的修正。"""
 
     def __init__(self, channels, width=WIDTH, modes=MODES, blocks=BLOCKS, *,
-                 unet_every_step=True, field_channels=2):
+                 depth_count, unet_every_step=True, field_channels=2):
         super().__init__()
         self.unet_every_step = unet_every_step
         self.lift = nn.Conv2d(channels, width, 1)
         self.spectral = nn.ModuleList(Spectral2D(width, modes) for _ in range(blocks))
         self.pointwise = nn.ModuleList(nn.Conv2d(width, width, 1) for _ in range(blocks))
         self.head = nn.Sequential(nn.Conv2d(width, width, 1), nn.GELU(),
-                                  nn.Conv2d(width, 1, 1))
+                                  nn.Conv2d(width, depth_count, 1))
         self.encode = nn.Sequential(nn.Conv2d(field_channels, 8, 3, padding=1), nn.GELU())
         self.low = nn.Sequential(nn.Conv2d(8, 12, 3, padding=1), nn.GELU(),
                                  nn.Conv2d(12, 8, 3, padding=1), nn.GELU())
         self.decode = nn.Sequential(nn.Conv2d(16, 8, 3, padding=1), nn.GELU(),
-                                    nn.Conv2d(8, 1, 1))
+                                    nn.Conv2d(8, depth_count, 1))
         nn.init.zeros_(self.head[-1].weight)
-        nn.init.constant_(self.head[-1].bias, -0.4)
+        nn.init.constant_(self.head[-1].bias, 0.05)
         nn.init.zeros_(self.decode[-1].weight)
         nn.init.zeros_(self.decode[-1].bias)
 
@@ -96,14 +98,21 @@ class PlasticFNO(nn.Module):
                 prediction = prediction + correction
             else:
                 prediction = prediction.index_add(0, indices, correction)
-        # 双线性标量本构的压平增量非负，输出以各工况的增量尺度无量纲化。
-        return F.softplus(prediction[:, 0], beta=4.0)
+        return F.relu(prediction)
+
+    def increments(self, inputs, initial_indices, depth_weights, modulus, tangent_ratio, stress_scale):
+        """同一逐深度屈服超量驱动两个增量，单位分别为 mm 和 MPa。"""
+        excess = self(inputs, initial_indices) * stress_scale[:, None, None, None]
+        integrated = (excess * depth_weights[None, :, None, None]).sum(dim=1)
+        plastic = (0.1 * (1 - tangent_ratio) / modulus)[:, None, None] * integrated
+        hardening = tangent_ratio[:, None, None, None] * excess
+        return plastic, hardening
 
 
 class Features:
     """物理场、材料参数和同网格复用的 72 通道坐标编码。"""
 
-    def __init__(self, h, area, device, depth_count, *, use_updated_surface=True,
+    def __init__(self, h, area, device, *, use_updated_surface=True,
                  material_channels=4):
         self.h, self.device, self.area = h, device, area
         self.use_updated_surface = use_updated_surface
@@ -117,10 +126,9 @@ class Features:
         phase = 2 * np.pi * (xy @ self.b)
         position = np.concatenate((np.sin(phase), np.cos(phase)), axis=-1).transpose(2, 0, 1)
         self.position = torch.as_tensor(position, dtype=torch.float32, device=device)
-        self.channels = self.field_channels + material_channels + len(self.position) + depth_count
+        self.channels = self.field_channels + material_channels + len(self.position)
 
-    def __call__(self, row, state, contact):
-        plastic = state.displacement
+    def __call__(self, row, plastic, pressure, elastic=None):
         scale = self.length
         material = [effective_modulus(row) / 1e5, row["n1"], row["Q1"] / 1e3, row["T1"] / 1e4]
         if self.material_channels == 6:
@@ -129,14 +137,13 @@ class Features:
             material.append(row["F"] / (self.area * plastic.size * 1e3))
         constants = np.broadcast_to(np.asarray(material)[:, None, None],
                                     (self.material_channels, *plastic.shape))
-        pressure = contact.pressure / 1e3
+        pressure = pressure / 1e3
         if self.use_updated_surface:
             fields = np.stack(((self.h + plastic) / scale, pressure))
         else:
             # 旧权重按其训练时的输入顺序读取四个物理场。
-            fields = np.stack((self.h / scale, plastic / scale, pressure, contact.elastic / scale))
-        hardening = (state.hardening - row["Q1"]) / 1e3
-        physical = np.concatenate((fields, constants, hardening), axis=0)
+            fields = np.stack((self.h / scale, plastic / scale, pressure, elastic / scale))
+        physical = np.concatenate((fields, constants), axis=0)
         channels = torch.as_tensor(physical, dtype=torch.float32, device=self.device)
         return torch.cat((channels, self.position))
 
@@ -149,30 +156,35 @@ class Trial:
     contact: Contact
     law_increment: np.ndarray
     next_hardening: np.ndarray
-    increment_scale: float
-
-    def plastic_increment(self, predicted_increment):
-        """返回会实际累加到形貌上的塑性位移增量。"""
-        return np.where(self.law_increment > 0, predicted_increment, 0)
 
     def advance(self, increment):
-        # 双线性律从同一个深度屈服超量得到位移增量和硬化增量。
-        # 网络改变表面增量后，两者必须用同一比例推进。
-        yielded = self.law_increment > 0
-        ratio = np.divide(increment, self.law_increment,
-                          out=np.zeros_like(self.law_increment), where=yielded)
-        hardening_change = self.next_hardening - self.state.hardening
-        hardening = self.state.hardening + ratio[None] * hardening_change
-        return PlasticState(self.state.displacement + increment, hardening,
-                            self.contact.pressure, self.state.step + 1)
+        return PlasticState(self.state.displacement + increment, self.next_hardening,
+                            step=self.state.step + 1)
 
 
 def evaluate_state(row, state, physics):
-    contact = physics.elastic.solve(row, state.displacement, state.previous_pressure)
+    contact = physics.elastic.predict_contact(row, state.displacement)
     law, next_hardening = physics.constitutive_step(row, contact.pressure, state.hardening)
-    nominal_pressure = row["F"] / (physics.elastic.area * state.displacement.size)
-    scale = 0.1 * float(physics.weights.sum()) * max(nominal_pressure, row["Q1"]) / effective_modulus(row)
-    return Trial(state, contact, law, next_hardening, scale)
+    return Trial(state, contact, law, next_hardening)
+
+
+def increment_parameters(inputs, rows, physics):
+    weights = inputs.new_tensor(physics.weights)
+    modulus = inputs.new_tensor([effective_modulus(row) for row in rows])
+    tangent = inputs.new_tensor([row["T1"] for row in rows]) / modulus
+    stress_scale = inputs.new_tensor([
+        max(row["Q1"], row["F"] / (physics.elastic.area * physics.elastic.h.size))
+        for row in rows
+    ])
+    return weights, modulus, tangent, stress_scale
+
+
+def coupled_loss(plastic, hardening, law, law_hardening, high):
+    plastic_scale = law.amax(dim=(1, 2), keepdim=True).clamp_min(5 * PLASTIC_TOL_MM)
+    hardening_scale = law_hardening.amax(dim=(1, 2, 3), keepdim=True).clamp_min(0.1)
+    return (loss_parts((plastic - law) / plastic_scale, high)
+            + loss_parts((hardening - law_hardening) / hardening_scale,
+                         high[:, None].expand_as(hardening)))
 
 
 def loss_parts(residual, high_pressure):
@@ -241,29 +253,31 @@ def train(model, rows, features, physics, stages, out, cfg):
                 trials = list(pool.map(trial_for, indices))
         else:
             trials = [trial_for(index) for index in indices]
-        inputs = torch.stack([features(rows[i], trial.state, trial.contact)
+        inputs = torch.stack([features(rows[i], trial.state.displacement,
+                                       trial.contact.pressure, trial.contact.elastic)
                               for i, trial in zip(indices, trials)])
         initial_indices = tuple(j for j, trial in enumerate(trials) if trial.state.step == 0)
         law = torch.as_tensor(np.stack([t.law_increment for t in trials]), device=device)
-        scale = torch.tensor([t.increment_scale for t in trials],
-                             device=device, dtype=inputs.dtype)[:, None, None]
-        normalizer = law.amax(dim=(1, 2), keepdim=True).clamp_min(5 * PLASTIC_TOL_MM)
+        law_hardening = torch.as_tensor(
+            np.stack([t.next_hardening - t.state.hardening for t in trials]), device=device)
+        parameters = increment_parameters(inputs, [rows[i] for i in indices], physics)
         high = torch.as_tensor(np.stack([high_pressure_mask(t.contact.pressure) for t in trials]),
                                device=device)
 
         def predict():
-            return model(inputs, initial_indices) * scale
+            return model.increments(inputs, initial_indices, *parameters)
 
         def compute():
             # 物理求解结果固定，梯度只穿过这一状态上的网络预测。
-            return loss_parts((predict() - law) / normalizer, high)
+            plastic, hardening = predict()
+            return coupled_loss(plastic, hardening, law, law_hardening, high)
 
         @torch.no_grad()
         def advance():
-            for i, trial, increment in zip(indices, trials, predict().cpu().numpy()):
-                if not np.isfinite(increment).all():
+            plastic, hardening = predict()
+            for i, trial, increment, delta_q in zip(indices, trials, plastic.cpu().numpy(), hardening.cpu().numpy()):
+                if not (np.isfinite(increment).all() and np.isfinite(delta_q).all()):
                     raise RuntimeError(f"工况 {i + 1} 的塑性更新出现 NaN 或 Inf。")
-                increment = trial.plastic_increment(increment)
                 next_state = trial.advance(increment)
                 finished = float(increment.max()) <= PLASTIC_TOL_MM
                 states[i] = (initial_states[i] if finished or next_state.step >= cfg.max_plastic_steps
@@ -291,13 +305,18 @@ def train(model, rows, features, physics, stages, out, cfg):
     def record_probe(stage, optimizer, step):
         fields = []
         for trial in probes:
-            inputs = features(probe_row, trial.state, trial.contact)[None]
+            inputs = features(probe_row, trial.state.displacement,
+                              trial.contact.pressure, trial.contact.elastic)[None]
             initial_indices = (0,) if trial.state.step == 0 else ()
-            prediction = model(inputs, initial_indices)[0].cpu().numpy() * trial.increment_scale
+            plastic, hardening = model.increments(
+                inputs, initial_indices, *increment_parameters(inputs, [probe_row], physics))
+            prediction = plastic[0].cpu().numpy()
+            hardening_error = hardening[0].cpu().numpy() - (trial.next_hardening - trial.state.hardening)
             law_mse, prediction_mse, residual_mse = plastic_update_mse(trial, prediction)
             fields.append(dict(plastic_step=trial.state.step + 1, law_increment_mse_mm2=law_mse,
                                predicted_increment_mse_mm2=prediction_mse,
-                               constitutive_residual_mse_mm2=residual_mse))
+                               constitutive_residual_mse_mm2=residual_mse,
+                               hardening_residual_mse_mpa2=field_mse(hardening_error)))
         row = dict(stage=stage, optimizer=optimizer, step=step, case=probe_index + 1, fields=fields)
         with (out / "training_probe.jsonl").open("a", encoding="utf-8") as file:
             file.write(json.dumps(row) + "\n")
@@ -399,8 +418,69 @@ def train(model, rows, features, physics, stages, out, cfg):
 
 
 @torch.no_grad()
+def predict_case(model, features, physics, row, number, max_steps=MAX_VALIDATION_STEPS):
+    """根据给定工况预测最终接触场和塑性位移。"""
+    if max_steps < 1:
+        raise ValueError("预测轮数必须为正整数。")
+    if not features.use_updated_surface:
+        raise ValueError("此塑性权重需要逐轮弹性位移输入，请使用等效形貌和压力输入的权重。")
+    elastic = physics.elastic
+    model.eval()
+    started = perf_counter()
+    displacement = np.zeros_like(elastic.h)
+    steps = 0
+    pressure = elastic.predict_pressure(row, displacement)
+    contact_s = perf_counter() - started
+    prediction_s = 0.0
+    parameters = None
+    for iteration in range(1, max_steps + 1):
+        prediction_started = perf_counter()
+        features_k = features(row, displacement, pressure.cpu().numpy())[None]
+        if parameters is None:
+            parameters = increment_parameters(features_k, [row], physics)
+        plastic, hardening = model.increments(features_k, (0,) if steps == 0 else (), *parameters)
+        increment, delta_q = plastic[0].cpu().numpy(), hardening[0].cpu().numpy()
+        prediction_s += perf_counter() - prediction_started
+        if not (np.isfinite(increment).all() and np.isfinite(delta_q).all()):
+            raise RuntimeError(f"工况 {number} 的塑性更新出现 NaN 或 Inf。")
+        increment_max = float(increment.max())
+        converged = increment_max < PLASTIC_TOL_MM
+        if iteration == 1 or iteration % 25 == 0 or converged or iteration == max_steps:
+            print(f"工况 {number}，第 {iteration} 轮，最大塑性增量 "
+                  f"{increment_max:.3e} mm，阈值 {PLASTIC_TOL_MM:.1e} mm，"
+                  f"累计弹性推理 {contact_s:.2f} s，网络及输入处理 {prediction_s:.2f} s", flush=True)
+        if converged:
+            break
+        displacement += increment
+        steps += 1
+        contact_started = perf_counter()
+        pressure = elastic.predict_pressure(row, displacement)
+        contact_s += perf_counter() - contact_started
+    recovery_started = perf_counter()
+    contact = elastic.predict_contact(row, displacement, pressure=pressure)
+    recovery_s = perf_counter() - recovery_started
+    solve_s = perf_counter() - started
+    item = {"correction_round": steps, "prediction_iterations": iteration,
+            "elapsed_s": solve_s, "model_solve_s": solve_s,
+            "elastic_contact_s": contact_s + recovery_s, "network_prediction_s": prediction_s,
+            "pressure_prediction_s": contact_s, "final_elastic_recovery_s": recovery_s,
+            "fb_max": contact.fb_max, "penetration_mm": contact.penetration,
+            "target_load_N": row["F"], "computed_load_N": contact.computed_load,
+            "load_rel_error": contact.load_rel_error,
+            "predicted_increment_max_mm": increment_max,
+            "plastic_update_max_mm": increment_max, "plastic_update_limit_mm": PLASTIC_TOL_MM,
+            "predicted_hardening_increment_max_mpa": float(delta_q.max()),
+            "plastic_converged": converged}
+    fields = dict(pressure=contact.pressure, elastic=contact.elastic,
+                  plastic=displacement, gap=contact.gap)
+    return fields, item
+
+
+@torch.no_grad()
 def evaluate(model, features, physics, rows, data, output, max_steps):
-    """只在训练结束后打开参考 ZIP，记录初值与每轮反馈的独立结果。"""
+    """只在训练结束后打开参考 ZIP，比较纯网络塑性迭代的最终结果。"""
+    if max_steps < 1:
+        raise ValueError("验收轮数必须为正整数。")
     elastic = physics.elastic
     archive = data / "case_验证集解析解.zip"
     h1, h2, _, _ = surfaces(data / "fixed_surfaces")
@@ -413,72 +493,32 @@ def evaluate(model, features, physics, rows, data, output, max_steps):
         row = rows[number - 1]
         mse_limits = {name: VALIDATION_MSE_FACTOR * field_mse(ref[name])
                       for name in ("pressure", "plastic")}
-        started = perf_counter()
-        state = physics.initial_state(row)
-        solve_s = perf_counter() - started
-        case_report = []
-        for k in range(max_steps + 1):
-            step_started = perf_counter()
-            trial = evaluate_state(row, state, physics)
-            contact = trial.contact
-            features_k = features(row, state, contact)[None]
-            predicted = model(features_k, (0,) if k == 0 else ())[0].cpu().numpy() * trial.increment_scale
-            update_mse = plastic_update_mse(trial, predicted)
-            if not all(np.isfinite(update_mse)):
-                raise RuntimeError(f"验收工况 {number} 的塑性更新出现 NaN 或 Inf。")
-            law_mse, prediction_mse, residual_mse = update_mse
-            increment = trial.plastic_increment(predicted)
-            increment_max = float(increment.max())
-            converged = increment_max <= PLASTIC_TOL_MM
-            solve_s += perf_counter() - step_started
-            item = {"correction_round": k, "elapsed_s": perf_counter() - started,
-                    "model_solve_s": solve_s,
-                    "fb_max": contact.fb_max, "penetration_mm": contact.penetration,
-                    "target_load_N": row["F"], "computed_load_N": contact.computed_load,
-                    "load_rel_error": contact.load_rel_error,
-                    "law_increment_max_mm": float(trial.law_increment.max()),
-                    "predicted_increment_max_mm": float(predicted.max()),
-                    "constitutive_residual_max_mm": float(np.abs(predicted - trial.law_increment).max()),
-                    "law_increment_mse_mm2": law_mse, "predicted_increment_mse_mm2": prediction_mse,
-                    "constitutive_residual_mse_mm2": residual_mse,
-                    "plastic_update_max_mm": increment_max, "plastic_update_limit_mm": PLASTIC_TOL_MM,
-                    "plastic_converged": converged}
-            for name, field in (("pressure", contact.pressure),
-                                ("elastic", contact.elastic), ("plastic", state.displacement)):
-                reference = ref[name]
-                error = field - reference
-                mse = field_mse(error)
-                item[name + "_mse"] = mse
-                if name == "elastic":
-                    relative_l2 = float(np.linalg.norm(error) / max(np.linalg.norm(reference), 1e-20))
-                    item["elastic_rel_l2"] = relative_l2
-                    item["elastic_rel_l2_limit"] = ELASTIC_REL_L2_LIMIT
-                    item["elastic_passed"] = relative_l2 <= ELASTIC_REL_L2_LIMIT
-                else:
-                    item[name + "_mae"] = float(np.mean(np.abs(error), dtype=np.float64))
-                    item[name + "_mse_limit"] = mse_limits[name]
-                    item[name + "_passed"] = mse <= mse_limits[name]
-                item[name + "_peak_abs"] = float(abs(field.max() - reference.max()))
-            item["all_fields_passed"] = all(item[name + "_passed"]
-                                             for name in ("pressure", "elastic", "plastic"))
-            case_report.append(item)
-            if k == 0 or converged or k == max_steps:
-                np.savez_compressed(output / f"case_{number:02d}_round_{k}.npz",
-                                    pressure=contact.pressure, elastic=contact.elastic, plastic=state.displacement,
-                                    gap=contact.gap, **{"reference_" + key: value for key, value in ref.items()})
-            if converged or k == max_steps:
-                break
-            if k > 0 and k % 25 == 0:
-                print(f"验收工况 {number}，第 {k} 步，最大塑性更新增量 "
-                      f"{increment_max:.3e} mm，阈值 {PLASTIC_TOL_MM:.1e} mm", flush=True)
-            advance_started = perf_counter()
-            state = trial.advance(increment)
-            solve_s += perf_counter() - advance_started
-        end = case_report[-1]
+        fields, item = predict_case(model, features, physics, row, number, max_steps)
+        for name in ("pressure", "elastic", "plastic"):
+            field = fields[name]
+            reference = ref[name]
+            error = field - reference
+            mse = field_mse(error)
+            item[name + "_mse"] = mse
+            if name == "elastic":
+                relative_l2 = float(np.linalg.norm(error) / max(np.linalg.norm(reference), 1e-20))
+                item["elastic_rel_l2"] = relative_l2
+                item["elastic_rel_l2_limit"] = ELASTIC_REL_L2_LIMIT
+                item["elastic_passed"] = relative_l2 <= ELASTIC_REL_L2_LIMIT
+            else:
+                item[name + "_mae"] = float(np.mean(np.abs(error), dtype=np.float64))
+                item[name + "_mse_limit"] = mse_limits[name]
+                item[name + "_passed"] = mse <= mse_limits[name]
+            item[name + "_peak_abs"] = float(abs(field.max() - reference.max()))
+        item["all_fields_passed"] = all(item[name + "_passed"]
+                                         for name in ("pressure", "elastic", "plastic"))
+        np.savez_compressed(output / f"case_{number:02d}_round_{item['correction_round']}.npz",
+                            **fields, **{"reference_" + key: value for key, value in ref.items()})
+        end = item
         passed = end["all_fields_passed"] and end["plastic_converged"]
-        results.append({"case": number, "passed": passed, "iterations": case_report})
+        results.append({"case": number, "passed": passed, "iterations": [end]})
         report_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-        status = "通过" if passed else ("场误差超限" if converged else "塑性未收敛")
+        status = "通过" if passed else ("场误差超限" if end["plastic_converged"] else "塑性未收敛")
         print(f"验收工况 {number}：{status}，{end['correction_round']} 步。"
               f"模型求解耗时 {end['model_solve_s']:.2f} s，"
               f"最大塑性更新增量 {end['plastic_update_max_mm']:.3e} mm，"
@@ -486,8 +526,7 @@ def evaluate(model, features, physics, rows, data, output, max_steps):
               f"压力 MAE={end['pressure_mae']:.3e} MPa，"
               f"塑性位移 MSE={end['plastic_mse']:.3e} mm^2（门槛 {end['plastic_mse_limit']:.3e}），"
               f"塑性位移 MAE={end['plastic_mae']:.3e} mm，"
-              f"弹性位移相对 L2={end['elastic_rel_l2']:.3%}，"
-              f"本构残差 MSE={end['constitutive_residual_mse_mm2']:.3e} mm^2", flush=True)
+              f"弹性位移相对 L2={end['elastic_rel_l2']:.3%}", flush=True)
     passed_cases = sum(case["passed"] for case in results)
     print(f"最终验收：{passed_cases}/{len(results)} 组塑性收敛且压力、塑性位移 MSE "
           f"及弹性位移相对 L2 均达到各自门槛。", flush=True)
@@ -505,35 +544,45 @@ def main():
     parser.add_argument("--depth-stride", type=int, default=4)
     parser.add_argument("--physics-workers", type=int, default=3)
     parser.add_argument("--max-plastic-steps", type=int, default=MAX_PLASTIC_STEPS,
-                        help="单条塑性轨迹的最大步数；短跑验收最多 3 步")
+                        help="训练中单条塑性轨迹的最大步数")
+    parser.add_argument("--max-validation-steps", type=int, default=MAX_VALIDATION_STEPS,
+                        help="验收的最大网络预测轮数")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--torch-threads", type=int, default=4)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--checkpoint", type=Path, help="仅做验收，不运行训练")
+    parser.add_argument("--elastic-checkpoint", type=Path, default=ELASTIC_WEIGHTS)
     args = parser.parse_args()
+    if not args.elastic_checkpoint.is_file():
+        parser.error("请先运行 train_elastic.py 训练弹性模型，或用 --elastic-checkpoint 指定权重。")
     if args.batch < 1 or args.physics_workers < 1 or args.max_plastic_steps < 1 or args.depth_stride < 1:
         parser.error("批量、物理线程数、塑性步数和深度步幅都必须为正整数。")
+    if args.max_validation_steps < 1:
+        parser.error("验收轮数必须为正整数。")
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(42)
     output = args.output or Path(__file__).resolve().parent / "runs" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     if args.checkpoint:
         saved = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
         if saved.get("training_method") != TRAINING_METHOD:
-            parser.error("此权重不是新版在线本构残差模型。旧轨迹监督模型需用对应旧版程序验收。")
+            parser.error("此权重与新版输入输出格式不兼容，请重新训练。")
         for key in ("size", "width", "modes", "blocks", "depth_stride"):
             setattr(args, key, saved[key])
     output.mkdir(parents=True, exist_ok=True)
     rows, h, dx, dy, dz = load_inputs(DATA, args.size)
-    elastic = ElasticContact(h, dx, dy, workers=1 if args.physics_workers > 1 else 2)
-    print(f"{args.size}×{args.size}，设备 {args.device}，构建弹性和体应力影响核，输出 {output}", flush=True)
-    physics = BilinearPhysics(elastic, dx, dy, dz, args.depth_stride)
+    elastic = load_elastic(args.elastic_checkpoint, h, dx, dy, args.device)
+    kernels = "弹性 MLP" if args.checkpoint else "弹性 MLP 和体应力影响核"
+    print(f"{args.size}×{args.size}，设备 {args.device}，准备{kernels}，输出 {output}", flush=True)
+    physics = BilinearPhysics(elastic, dx, dy, dz, args.depth_stride,
+                              build_stress_kernels=args.checkpoint is None)
     use_updated_surface = True if args.checkpoint is None else saved.get("use_updated_surface", False)
     material_channels = 4 if args.checkpoint is None else saved.get("material_channels", 6)
-    features = Features(h, dx * dy, args.device, len(physics.weights),
+    features = Features(h, dx * dy, args.device,
                         use_updated_surface=use_updated_surface, material_channels=material_channels)
     unet_every_step = True if args.checkpoint is None else saved.get("unet_every_step", False)
     model = PlasticFNO(features.channels, args.width, args.modes, args.blocks,
-                       unet_every_step=unet_every_step, field_channels=features.field_channels).to(args.device)
+                       depth_count=len(physics.weights), unet_every_step=unet_every_step,
+                       field_channels=features.field_channels).to(args.device)
     np.save(output / "coordinate_frequencies.npy", features.b)
     if args.checkpoint:
         model.load_state_dict(saved["model"])
@@ -549,7 +598,7 @@ def main():
         count = 2 if args.smoke else 25
         print(f"在线本构残差训练工况 1–{count}，留出 26–30 组，阶段 {stages}", flush=True)
         train(model, rows[:count], features, physics, stages, output, args)
-    max_steps = min(args.max_plastic_steps, 3) if args.smoke else args.max_plastic_steps
+    max_steps = min(args.max_validation_steps, 3) if args.smoke else args.max_validation_steps
     evaluate(model, features, physics, rows, DATA, output, max_steps)
 
 

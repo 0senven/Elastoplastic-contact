@@ -13,8 +13,9 @@ import numpy as np
 import torch
 from scipy.io import loadmat
 
-from physics import BilinearPhysics, ElasticContact, load_inputs, surfaces
-from train import DATA, MAX_PLASTIC_STEPS, ROOT, TRAINING_METHOD, Features, PlasticFNO, evaluate
+from train_elastic import ELASTIC_WEIGHTS, load_elastic
+from physics import BilinearPhysics, load_inputs, surfaces
+from train import DATA, MAX_VALIDATION_STEPS, ROOT, TRAINING_METHOD, Features, PlasticFNO, evaluate, predict_case
 
 
 CHECKPOINT = None  # 留空自动选择最新 operator.pt，也可填 Path(r"D:\...\operator.pt")
@@ -37,7 +38,9 @@ def plot_case(case, evaluation_dir, output, extent, matlab_parameters):
         model_time = f"Model validation {last['elapsed_s']:.2f} s"
     matlab_s = matlab_parameters.get("compute_time_s")
     matlab_time = f"MATLAB solve {matlab_s:.2f} s" if matlab_s is not None else "MATLAB timing unavailable"
-    fig.suptitle(f"Case {number} | {step} plastic steps | {status}\n{model_time} | {matlab_time}",
+    rounds = last.get("prediction_iterations")
+    steps = f"{rounds} prediction rounds" if rounds is not None else f"{step} plastic steps"
+    fig.suptitle(f"Case {number} | {steps} | {status}\n{model_time} | {matlab_time}",
                  fontsize=14)
     try:
         with np.load(fields_path) as fields:
@@ -74,11 +77,21 @@ def main():
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
     parser.add_argument("--output", type=Path, help="图片输出目录")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--max-plastic-steps", type=int, default=MAX_PLASTIC_STEPS)
+    parser.add_argument("--max-plastic-steps", type=int, default=MAX_VALIDATION_STEPS)
+    parser.add_argument("--case", type=int, choices=range(1, 31), metavar="1–30",
+                        help="仅预测指定工况，输出最终场及状态")
+    parser.add_argument("--load", type=float, help="覆盖单工况的法向载荷（N）")
     parser.add_argument("--saved", action="store_true", help="直接绘制所选模型已有的完整验收结果")
+    parser.add_argument("--elastic-checkpoint", type=Path, default=ELASTIC_WEIGHTS)
     args = parser.parse_args()
+    if not args.saved and not args.elastic_checkpoint.is_file():
+        parser.error("请先运行 train_elastic.py 训练弹性模型，或用 --elastic-checkpoint 指定权重。")
     if args.max_plastic_steps < 1:
         parser.error("最大塑性步数须为正整数。")
+    if args.case is not None and args.saved:
+        parser.error("--case 与 --saved 不能同时使用。")
+    if args.load is not None and (args.case is None or not np.isfinite(args.load) or args.load <= 0):
+        parser.error("--load 需要配合 --case 使用，载荷须为有限正数。")
 
     checkpoint = args.checkpoint
     if checkpoint is None:
@@ -105,19 +118,34 @@ def main():
         torch.set_num_threads(4)
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if saved.get("training_method") != TRAINING_METHOD:
-            parser.error("该模型与当前在线本构残差程序不兼容。")
+            parser.error("此权重与新版输入输出格式不兼容，请重新训练。")
         rows, h, dx, dy, dz = load_inputs(DATA, saved["size"])
         domain_x, domain_y = h.shape[1] * dx, h.shape[0] * dy
-        elastic = ElasticContact(h, dx, dy, workers=2)
-        physics = BilinearPhysics(elastic, dx, dy, dz, saved["depth_stride"])
-        features = Features(h, dx * dy, args.device, len(physics.weights),
+        elastic = load_elastic(args.elastic_checkpoint, h, dx, dy, args.device)
+        physics = BilinearPhysics(elastic, dx, dy, dz, saved["depth_stride"], build_stress_kernels=False)
+        features = Features(h, dx * dy, args.device,
                             use_updated_surface=saved.get("use_updated_surface", False),
                             material_channels=saved.get("material_channels", 6))
         model = PlasticFNO(features.channels, saved["width"], saved["modes"], saved["blocks"],
+                           depth_count=len(physics.weights),
                            unet_every_step=saved.get("unet_every_step", False),
                            field_channels=features.field_channels)
         model.load_state_dict(saved["model"])
         model.to(args.device)
+        if args.case is not None:
+            row = rows[args.case - 1].copy()
+            if args.load is not None:
+                row["F"] = args.load
+            fields, info = predict_case(model, features, physics, row, args.case, args.max_plastic_steps)
+            path = output / f"prediction_case_{args.case:02d}.npz"
+            np.savez_compressed(path, **fields, x_extent_mm=(-domain_x / 2, domain_x / 2),
+                                y_extent_mm=(-domain_y / 2, domain_y / 2))
+            path.with_suffix(".json").write_text(
+                json.dumps(dict(case=args.case, inputs=row, **info), ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            status = "收敛" if info["plastic_converged"] else "达到轮数上限"
+            print(f"预测完成，{info['prediction_iterations']} 轮，{status}。结果 {path.resolve()}", flush=True)
+            return
         evaluation_dir.mkdir(parents=True, exist_ok=True)
         evaluate(model, features, physics, rows, DATA, evaluation_dir, args.max_plastic_steps)
 

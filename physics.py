@@ -54,15 +54,6 @@ def surfaces(folder):
     return h1, h2, float(grid["dx"]), float(grid["dy"])
 
 
-def simplex(v, total):
-    """投影到非负且总和固定的压力集合。"""
-    sorted_values = np.sort(v.ravel())[::-1]
-    cumulative = np.cumsum(sorted_values) - total
-    active = sorted_values > cumulative / np.arange(1, sorted_values.size + 1)
-    last = np.flatnonzero(active)[-1]
-    return np.maximum(v - cumulative[last] / (last + 1), 0)
-
-
 def displacement_kernel(shape, dx, dy):
     """单位等效模量下矩形压力单元的法向位移核。"""
     ny, nx = shape
@@ -122,7 +113,6 @@ class PlasticState:
 
     displacement: np.ndarray
     hardening: np.ndarray
-    previous_pressure: np.ndarray | None = None
     step: int = 0
 
 
@@ -148,68 +138,6 @@ def load_inputs(data, size):
     return rows, h, dx * raw.shape[1] / size, dy * raw.shape[0] / size, dx
 
 
-class ElasticContact:
-    """镜像延拓与 MATLAB 一致，压力投影到固定总力的单纯形。"""
-
-    def __init__(self, h, dx, dy, fb_tol=2e-4, penetration_tol=2e-6, workers=2,
-                 load_tol=1e-8):
-        self.h = h
-        self.n = len(h)
-        self.area = dx * dy
-        self.fb_tol, self.penetration_tol, self.workers = fb_tol, penetration_tol, workers
-        self.load_tol = load_tol
-        self.fft_shape = (2 * self.n, 2 * self.n)
-        self.kernel = displacement_kernel(h.shape, dx, dy)
-        self.row_bound = self.apply(np.ones_like(h)).max()
-        self.length = max(np.ptp(h), 1e-12)
-
-    def apply(self, p):
-        wide = np.concatenate((p, p[:, ::-1]), axis=1)
-        mirrored = np.concatenate((wide, wide[::-1]), axis=0)
-        field = irfft2(rfft2(mirrored, workers=self.workers) * self.kernel,
-                       s=self.fft_shape, workers=self.workers)
-        return field[:self.n, :self.n]
-
-    def solve(self, row, plastic, previous=None, max_iter=2400):
-        e_star = effective_modulus(row)
-        target_load = row["F"]
-        total = target_load / self.area
-        p0 = total / plastic.size
-        p = np.full_like(self.h, p0) if previous is None else previous.copy()
-        y = p.copy()
-        t = 1.0
-        base = self.h + plastic             # MATLAB 存的是初始间隙，塑性后加大间隙。
-        step = e_star / self.row_bound
-        for it in range(max_iter):
-            new = simplex(y - step * (base + self.apply(y) / e_star), total)
-            next_t = (1 + np.sqrt(1 + 4 * t * t)) / 2
-            # 自适应重启防止动量在接触斑切换后持续振荡。
-            if np.einsum("ij,ij->", y - new, new - p) > 0:
-                next_t = 1.0
-            y = new + (t - 1) / next_t * (new - p) if next_t > 1 else new
-            p, t = new, next_t
-            if it % 8 == 0 or it + 1 == max_iter:
-                elastic = self.apply(p) / e_star
-                z = base + elastic
-                pressure_sum = float(np.sum(p, dtype=np.float64))
-                gap = z - np.sum(p * z) / pressure_sum
-                pn, gn = p / p0, gap / self.length
-                fb = np.max(np.abs(np.hypot(pn, gn) - pn - gn))
-                penetration = max(0.0, -float(gap.min()))
-                # 以实际求出的压力积分检查力控投影和网格面积。
-                computed_load = self.area * pressure_sum
-                load_rel_error = abs(computed_load - target_load) / target_load
-                if (fb <= self.fb_tol and penetration <= self.penetration_tol
-                        and load_rel_error <= self.load_tol):
-                    return Contact(p, elastic, gap, float(fb), penetration, it + 1,
-                                   computed_load, load_rel_error)
-        raise RuntimeError(
-            f"弹性接触未通过验收：FB={fb:.3g}，穿透={penetration:.3g} mm，"
-            f"计算载荷={computed_load:.8g} N，目标载荷={target_load:.8g} N，"
-            f"载荷相对误差={load_rel_error:.3g}"
-        )
-
-
 def effective_modulus(row):
     return 1 / sum((1 - row[f"n{i}"] ** 2) / row[f"E{i}"] for i in (1, 2))
 
@@ -217,13 +145,15 @@ def effective_modulus(row):
 class BilinearPhysics:
     """由压力生成体内应力，保留逐深度的双线性硬化历史。"""
 
-    def __init__(self, elastic, dx, dy, original_dz, depth_stride=4):
+    def __init__(self, elastic, dx, dy, original_dz, depth_stride=4, *, build_stress_kernels=True):
         self.elastic = elastic
         # 保留表面层。其他原始深度层分组，用中点代表，权重保留原深度积分。
         groups = [[0]] + [list(range(i, min(i + depth_stride, 51)))
                           for i in range(1, 51, depth_stride)]
         indices = [g[len(g) // 2] for g in groups]
         self.weights = np.asarray([len(g) * original_dz for g in groups], dtype=np.float32)
+        if not build_stress_kernels:
+            return
         n = elastic.n
         self.bases = np.empty((2, len(indices), 6, 2 * n, n + 1), dtype=np.complex64)
         for basis_index, nu in enumerate((0.0, 0.25)):
@@ -261,16 +191,16 @@ class BilinearPhysics:
         return increment, next_hardening
 
     def trajectory(self, row, tol=1e-6, steps=500):
-        """独立的纯本构基线，供数值对照。"""
+        """使用弹性网络和塑性本构生成对照轨迹。"""
         state = self.initial_state(row)
         plastic, hardening = state.displacement, state.hardening
-        initial = self.elastic.solve(row, plastic)
+        initial = self.elastic.predict_contact(row, plastic)
         contact = initial
         samples = [(plastic.copy(), initial)]
         for step in range(steps):
             increment, hardening = self.constitutive_step(row, contact.pressure, hardening)
             plastic += increment
-            contact = self.elastic.solve(row, plastic, contact.pressure)
+            contact = self.elastic.predict_contact(row, plastic)
             if step in (7, 23, 63) or increment.max() <= tol:
                 samples.append((plastic.copy(), contact))
             if increment.max() <= tol:
