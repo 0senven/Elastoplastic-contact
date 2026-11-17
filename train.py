@@ -16,7 +16,7 @@ STAGES = ((3000, 0), (1000, 200), (0, 200))  # Adam 更新数，L-BFGS 外层步
 MAX_PLASTIC_STEPS = 500
 MAX_VALIDATION_STEPS = 10000
 PLASTIC_TOL_MM = 1e-6
-TRAINING_METHOD = "online_coupled_hardening_elastic_mlp_v1"
+TRAINING_METHOD = "online_coupled_hardening_elastic_mlp_v2"
 ROLLOUT_REVISION = 4
 ELASTIC_REL_L2_LIMIT = 0.05
 VALIDATION_MSE_FACTOR = 0.0025  # 压力、塑性位移的 MSE 门槛占对应参考场均方值的比例
@@ -98,7 +98,7 @@ class PlasticFNO(nn.Module):
                 prediction = prediction + correction
             else:
                 prediction = prediction.index_add(0, indices, correction)
-        return F.relu(prediction)
+        return F.softplus(prediction, beta=8.0)
 
     def increments(self, inputs, initial_indices, depth_weights, modulus, tangent_ratio, stress_scale):
         """同一逐深度屈服超量驱动两个增量，单位分别为 mm 和 MPa。"""
@@ -518,7 +518,12 @@ def evaluate(model, features, physics, rows, data, output, max_steps):
         passed = end["all_fields_passed"] and end["plastic_converged"]
         results.append({"case": number, "passed": passed, "iterations": [end]})
         report_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-        status = "通过" if passed else ("场误差超限" if end["plastic_converged"] else "塑性未收敛")
+        if passed:
+            status = "通过"
+        elif end["plastic_converged"] and end["correction_round"] == 0:
+            status = "首轮增量低于阈值，未推进且场误差超限"
+        else:
+            status = "场误差超限" if end["plastic_converged"] else "塑性未收敛"
         print(f"验收工况 {number}：{status}，{end['correction_round']} 步。"
               f"模型求解耗时 {end['model_solve_s']:.2f} s，"
               f"最大塑性更新增量 {end['plastic_update_max_mm']:.3e} mm，"

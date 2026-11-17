@@ -31,7 +31,12 @@ def plot_case(case, evaluation_dir, output, extent, matlab_parameters):
     number, step = case["case"], last["correction_round"]
     fields_path = evaluation_dir / f"case_{number:02d}_round_{step}.npz"
     fig, axes = plt.subplots(3, 3, figsize=(13, 11), layout="constrained")
-    status = "converged" if last["plastic_converged"] else "plastic iteration did not converge"
+    if last["plastic_converged"] and step == 0:
+        status = "first increment below tolerance, no plastic update"
+    else:
+        status = "increment below tolerance" if last["plastic_converged"] else "plastic iteration did not converge"
+    if "all_fields_passed" in last and not last["all_fields_passed"]:
+        status += " | field comparison failed"
     if "model_solve_s" in last:
         model_time = f"Model solve {last['model_solve_s']:.2f} s"
     else:
@@ -50,11 +55,14 @@ def plot_case(case, evaluation_dir, output, extent, matlab_parameters):
                 difference = predicted - reference
                 low = min(predicted.min(), reference.min())
                 high = max(predicted.max(), reference.max())
+                separate_scales = key == "plastic"
+                model_limits = (0, max(float(predicted.max()), np.finfo(float).eps)) if separate_scales else (low, high)
+                reference_limits = (0, max(float(reference.max()), np.finfo(float).eps)) if separate_scales else (low, high)
                 error_limit = max(float(np.abs(difference).max()), np.finfo(float).eps)
                 mae = np.mean(np.abs(difference), dtype=np.float64)
                 for col, (field, title, cmap, vmin, vmax) in enumerate((
-                    (predicted, "Model", "viridis", low, high),
-                    (reference, "MATLAB", "viridis", low, high),
+                    (predicted, "Model", "viridis", *model_limits),
+                    (reference, "MATLAB", "viridis", *reference_limits),
                     (difference, f"Model − MATLAB | MAE {mae:.3g} {unit}", "RdBu_r", -error_limit, error_limit),
                 )):
                     ax = axes[row, col]
@@ -63,7 +71,9 @@ def plot_case(case, evaluation_dir, output, extent, matlab_parameters):
                     ax.set_title(title)
                     ax.set_xlabel("x (mm)")
                     ax.set_ylabel(f"{name}\ny (mm)" if col == 0 else "y (mm)")
-                    if col == 1:
+                    if separate_scales and col < 2:
+                        fig.colorbar(image, ax=ax, label=f"{unit} (own scale)", shrink=0.86)
+                    elif col == 1:
                         fig.colorbar(image, ax=axes[row, :2], label=unit, shrink=0.86)
                     elif col == 2:
                         fig.colorbar(image, ax=ax, label=unit, shrink=0.86)
@@ -143,7 +153,10 @@ def main():
             path.with_suffix(".json").write_text(
                 json.dumps(dict(case=args.case, inputs=row, **info), ensure_ascii=False, indent=2),
                 encoding="utf-8")
-            status = "收敛" if info["plastic_converged"] else "达到轮数上限"
+            if info["plastic_converged"] and info["correction_round"] == 0:
+                status = "首轮增量低于阈值，未推进塑性位移"
+            else:
+                status = "达到增量阈值" if info["plastic_converged"] else "达到轮数上限"
             print(f"预测完成，{info['prediction_iterations']} 轮，{status}。结果 {path.resolve()}", flush=True)
             return
         evaluation_dir.mkdir(parents=True, exist_ok=True)
